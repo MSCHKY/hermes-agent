@@ -148,7 +148,7 @@ class TestManifestParsing:
             install={
                 "type": "git",
                 "url": "https://example.com/demo.git",
-                "ref": "v1.0.0",
+                "ref": "0123456789abcdef0123456789abcdef01234567",
                 "bootstrap": ["pip install -r requirements.txt"],
             },
             transport={
@@ -163,7 +163,7 @@ class TestManifestParsing:
         e = list_catalog()[0]
         assert e.install is not None
         assert e.install.url == "https://example.com/demo.git"
-        assert e.install.ref == "v1.0.0"
+        assert e.install.ref == "0123456789abcdef0123456789abcdef01234567"
         assert e.install.bootstrap == ["pip install -r requirements.txt"]
 
     def test_invalid_manifest_skipped(self, catalog_dir):
@@ -244,7 +244,7 @@ class TestInstall:
             install={
                 "type": "git",
                 "url": "https://example.com/demo.git",
-                "ref": "main",
+                "ref": "89abcdef0123456789abcdef0123456789abcdef",
                 "bootstrap": [],
             },
             transport={
@@ -640,15 +640,13 @@ class TestCustomMcpRows:
 
 
 # ---------------------------------------------------------------------------
-# Git install — SHA ref detection
+# Git install — immutable commit refs
 # ---------------------------------------------------------------------------
 
 
 class TestGitInstallShaRef:
     def test_sha_ref_skips_branch_attempt(self, catalog_dir, monkeypatch, tmp_path):
-        """When install.ref is a SHA-shaped hex string, _do_git_install
-        skips the `git clone --branch <ref>` attempt (which would always fail
-        noisily for SHAs) and goes straight to clone + checkout."""
+        """Full commit SHAs use plain clone + checkout, never branch clone."""
         body = _basic_manifest(
             install={
                 "type": "git",
@@ -698,43 +696,34 @@ class TestGitInstallShaRef:
         assert len(clone_calls) == 1, calls
         assert len(checkout_calls) == 1, calls
 
-    def test_branch_ref_uses_branch_clone(self, catalog_dir, monkeypatch):
-        """When install.ref is a branch/tag (not SHA-shaped), the fast
-        `git clone --depth 1 --branch <ref>` path is used."""
-        body = _basic_manifest(
-            install={
-                "type": "git",
-                "url": "https://example.com/x.git",
-                "ref": "v1.0.0",  # Tag-shaped
-                "bootstrap": [],
-            },
-            transport={
-                "type": "stdio",
-                "command": "${INSTALL_DIR}/run.sh",
-                "args": [],
-            },
-        )
-        _write_manifest(catalog_dir, "demo", body)
+    def test_branch_and_tag_refs_are_rejected_by_manifest_validator(self, catalog_dir):
+        for idx, ref in enumerate(["main", "master", "HEAD", "refs/heads/main", "v1.0.0", "abc1234"]):
+            _write_manifest(
+                catalog_dir,
+                f"demo-{idx}",
+                _basic_manifest(
+                    f"demo-{idx}",
+                    install={
+                        "type": "git",
+                        "url": "https://example.com/x.git",
+                        "ref": ref,
+                        "bootstrap": [],
+                    },
+                    transport={
+                        "type": "stdio",
+                        "command": "${INSTALL_DIR}/run.sh",
+                        "args": [],
+                    },
+                ),
+            )
 
-        from hermes_cli import mcp_catalog
-        from hermes_cli.mcp_catalog import _do_git_install, get_entry
+        from hermes_cli.mcp_catalog import catalog_diagnostics, list_catalog
 
-        calls = []
-
-        class _FakeProc:
-            def __init__(self, returncode):
-                self.returncode = returncode
-
-        def fake_run(argv, *args, **kwargs):
-            calls.append(list(argv))
-            return _FakeProc(returncode=0)
-
-        monkeypatch.setattr(mcp_catalog.subprocess, "run", fake_run)
-        monkeypatch.setattr(mcp_catalog.shutil, "which", lambda x: "/usr/bin/git")
-
-        _do_git_install(get_entry("demo"))
-        branch_attempts = [c for c in calls if "--branch" in c]
-        assert len(branch_attempts) == 1, calls
+        assert list_catalog() == []
+        diagnostics = catalog_diagnostics()
+        assert len(diagnostics) == 6
+        assert all(kind == "invalid" for _, kind, _ in diagnostics)
+        assert all("full 40-character commit SHA" in msg for _, _, msg in diagnostics)
 
 
 # ---------------------------------------------------------------------------

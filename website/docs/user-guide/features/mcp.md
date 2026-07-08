@@ -134,6 +134,10 @@ bootstrap commands, and setup notes — with the `source:` rendered as a
 clickable link, so you can inspect exactly what an entry connects to or runs
 before clicking Install.
 
+For catalog git installs, `install.ref` must be a full 40-character commit
+SHA. Branches, tags, `HEAD`, and short SHAs are rejected because the catalog
+install path may run `install.bootstrap` commands from that checkout.
+
 ### Manifest version compatibility
 
 Manifests pin a `manifest_version`. The catalog is forward-compatible: if a

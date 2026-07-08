@@ -10,9 +10,11 @@ Catalog policy:
 - Entries are added only by merging a PR into hermes-agent. Presence in the
   ``optional-mcps/`` directory = Nous approval. No community tier, no trust
   signals beyond "it's in the catalog".
-- Manifests pin transport details (commands, args, refs). MCPs are never
-  auto-updated; users explicitly re-run ``hermes mcp install <name>`` to
-  pull a new manifest version after a repo update.
+- Manifests pin transport details (commands, args, refs). Git install refs
+  must be full 40-character commit SHAs; branches, tags, HEAD, and short SHAs
+  are rejected because catalog installs can run bootstrap code from the clone.
+  MCPs are never auto-updated; users explicitly re-run ``hermes mcp install
+  <name>`` to pull a new manifest version after a repo update.
 - Secrets prompted at install time go to ``~/.hermes/.env`` (the
   .env-is-for-secrets rule). Non-secret env vars also go to .env to keep
   one credential store.
@@ -43,6 +45,7 @@ from hermes_cli.config import (
 from hermes_cli.cli_output import prompt as _prompt_input
 
 _MANIFEST_VERSION = 1
+_FULL_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 
 # Substituted at install time inside `transport.command` / `transport.args`.
 _INSTALL_DIR_VAR = "${INSTALL_DIR}"
@@ -87,7 +90,7 @@ class InstallSpec:
     """
     type: str  # "git"
     url: str
-    ref: str  # commit/tag/branch — pinned, never floats
+    ref: str  # full 40-character commit SHA; branches/tags are rejected
     bootstrap: List[str] = field(default_factory=list)
 
 
@@ -130,6 +133,10 @@ def _catalog_root() -> Path:
     # Prefer the env-var override / packaged location; fall back to the repo's
     # optional-mcps/ next to the package (source checkout).
     return get_optional_mcps_dir(Path(__file__).parent.parent / "optional-mcps")
+
+
+def _is_full_commit_sha(ref: str) -> bool:
+    return bool(_FULL_COMMIT_SHA_RE.fullmatch(ref))
 
 
 def _parse_env_spec(raw: Any) -> EnvVarSpec:
@@ -235,10 +242,16 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         i_type = install_raw.get("type")
         if i_type != "git":
             raise CatalogError(f"{path}: install.type must be 'git' (got {i_type!r})")
-        url = install_raw.get("url") or ""
-        ref = install_raw.get("ref") or ""
+        url = str(install_raw.get("url") or "").strip()
+        ref = str(install_raw.get("ref") or "").strip()
         if not url or not ref:
             raise CatalogError(f"{path}: install.url and install.ref are required")
+        if not _is_full_commit_sha(ref):
+            raise CatalogError(
+                f"{path}: install.ref must be a full 40-character commit SHA "
+                "for catalog git installs; branches, tags, HEAD, and short SHAs "
+                "are not accepted"
+            )
         bootstrap = install_raw.get("bootstrap") or []
         if not isinstance(bootstrap, list):
             raise CatalogError(f"{path}: install.bootstrap must be a list")
@@ -390,32 +403,18 @@ def _do_git_install(entry: CatalogEntry) -> Path:
 
     print(color(f"  Cloning {install.url} ({install.ref}) → {dest}", Colors.CYAN))
 
-    # `git clone --branch` only accepts branches and tags, NOT commit SHAs.
-    # Detecting SHA-shaped refs upfront avoids a guaranteed stderr leak on
-    # the fast path (the --branch attempt would always fail noisily for a
-    # SHA ref before we fall back to full-clone-then-checkout).
-    is_sha_ref = bool(re.fullmatch(r"[0-9a-f]{7,40}", install.ref))
-
-    if not is_sha_ref:
-        proc = subprocess.run(
-            [git, "clone", "--depth", "1", "--branch", install.ref, install.url, str(dest)],
+    if not _is_full_commit_sha(install.ref):
+        raise CatalogError(
+            "install.ref must be a full 40-character commit SHA; "
+            "branches, tags, HEAD, and short SHAs are not accepted"
         )
-        if proc.returncode == 0:
-            pass
-        else:
-            # Branch/tag form failed (unlikely for valid manifests; possible if
-            # the ref was deleted upstream). Fall through to the full-clone path.
-            if dest.exists():
-                shutil.rmtree(dest)
-            is_sha_ref = True  # treat the same as a SHA ref from here
 
-    if is_sha_ref:
-        proc = subprocess.run([git, "clone", install.url, str(dest)])
-        if proc.returncode != 0:
-            raise CatalogError(f"git clone failed for {install.url}")
-        proc = subprocess.run([git, "-C", str(dest), "checkout", install.ref])
-        if proc.returncode != 0:
-            raise CatalogError(f"git checkout {install.ref} failed")
+    proc = subprocess.run([git, "clone", install.url, str(dest)])
+    if proc.returncode != 0:
+        raise CatalogError(f"git clone failed for {install.url}")
+    proc = subprocess.run([git, "-C", str(dest), "checkout", install.ref])
+    if proc.returncode != 0:
+        raise CatalogError(f"git checkout {install.ref} failed")
 
     if install.bootstrap:
         _run_bootstrap(dest, install.bootstrap)
