@@ -9,6 +9,7 @@ import json
 import io
 import os
 import shutil
+import stat
 import sys
 import tarfile
 import types
@@ -1224,6 +1225,53 @@ class TestExportImport:
         assert imported == get_profile_dir("renamed")
         assert (imported / "marker.txt").read_text() == "imported"
         assert (victim_dir / "marker.txt").read_text() == "original"
+
+    def test_import_clamps_sensitive_state_modes(self, profile_env, tmp_path):
+        archive_path = tmp_path / "export" / "unsafe.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def add_dir(tf, name, mode=0o777):
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mode = mode
+            tf.addfile(info)
+
+        def add_file(tf, name, data=b"runtime", mode=0o666):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = mode
+            tf.addfile(info, io.BytesIO(data))
+
+        with tarfile.open(archive_path, "w:gz") as tf:
+            add_dir(tf, "source")
+            add_file(tf, "source/config.yaml", b"model: test\n", mode=0o644)
+            add_file(tf, "source/state.db", mode=0o666)
+            add_file(tf, "source/gateway_state.json", b"{}", mode=0o666)
+            add_file(tf, "source/processes.json", b"{}", mode=0o666)
+            add_dir(tf, "source/sessions", mode=0o777)
+            add_file(tf, "source/sessions/request_dump_abc_20260628.json", mode=0o666)
+            add_dir(tf, "source/backups", mode=0o777)
+            add_file(tf, "source/backups/state.db", mode=0o666)
+            add_dir(tf, "source/state-snapshots", mode=0o777)
+            add_file(tf, "source/state-snapshots/state.db", mode=0o666)
+            add_dir(tf, "source/checkpoints", mode=0o777)
+            add_file(tf, "source/checkpoints/index", mode=0o666)
+
+        imported = import_profile(str(archive_path), name="secure")
+
+        assert stat.S_IMODE((imported / "config.yaml").stat().st_mode) == 0o644
+        for rel_path in (
+            "state.db",
+            "gateway_state.json",
+            "processes.json",
+            "sessions/request_dump_abc_20260628.json",
+            "backups/state.db",
+            "state-snapshots/state.db",
+            "checkpoints/index",
+        ):
+            assert stat.S_IMODE((imported / rel_path).stat().st_mode) == 0o600
+        for rel_path in ("sessions", "backups", "state-snapshots", "checkpoints"):
+            assert stat.S_IMODE((imported / rel_path).stat().st_mode) == 0o700
 
     def test_import_rejects_archive_with_multiple_top_level_directories(
         self, profile_env, tmp_path

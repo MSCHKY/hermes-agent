@@ -196,10 +196,12 @@ def _clone_all_copytree_ignore(source_dir: Path):
     return _ignore
 
 
-# Directories/files to exclude when exporting the default (~/.hermes) profile.
-# The default profile contains infrastructure (repo checkout, worktrees, DBs,
-# caches, binaries) that named profiles don't have.  We exclude those so the
-# export is a portable, reasonable-size archive of actual profile data.
+# Directories/files to exclude when exporting a profile.  The default profile
+# contains extra infrastructure (repo checkout, worktrees, sibling profiles,
+# binaries), but named profiles also accumulate runtime state, history,
+# backups, sessions, snapshots, and checkpoint artifacts.  A profile export is
+# a portable archive intended for sharing/restoring identity/config — it must
+# not package runtime or residual state by default.
 _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     # Infrastructure
     "hermes-agent",         # repo checkout (multi-GB)
@@ -217,11 +219,11 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "auth.lock", "active_profile", ".update_check",
     "errors.log",
     ".hermes_history",
-    # Caches (regenerated on use)
+    # Caches/history/state (regenerated or sensitive runtime residue)
     "image_cache", "audio_cache", "document_cache",
     "browser_screenshots", "checkpoints",
-    "sandboxes",
-    "logs",                 # gateway logs
+    "sandboxes", "sessions", "backup", "backups", "state-snapshots",
+    "logs",                 # gateway logs / request dumps
 })
 
 # Allow-list for ``export_profile("default")``: when HERMES_HOME equals the
@@ -242,6 +244,63 @@ _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # Plugin / memory surfaces (per-profile overrides live here)
     "plugins", "memories", "knowledge", "preferences",
 })
+
+_PROFILE_IMPORT_SENSITIVE_DIRS: frozenset[str] = frozenset({
+    "sessions",
+    "backup",
+    "backups",
+    "state-snapshots",
+    "checkpoints",
+    "logs",
+})
+
+_PROFILE_IMPORT_SENSITIVE_FILES: frozenset[str] = frozenset({
+    ".env",
+    "auth.json",
+    "state.db",
+    "state.db-shm",
+    "state.db-wal",
+    "hermes_state.db",
+    "response_store.db",
+    "response_store.db-shm",
+    "response_store.db-wal",
+    "gateway_state.json",
+    "processes.json",
+})
+
+
+def _is_request_dump_name(name: str) -> bool:
+    return name.startswith("request_dump_") and name.endswith(".json")
+
+
+def _profile_import_path_is_sensitive(parts: list[str]) -> bool:
+    """Return true for profile import paths that must be owner-only."""
+
+    if not parts:
+        return False
+    if any(part in _PROFILE_IMPORT_SENSITIVE_DIRS for part in parts):
+        return True
+    leaf = parts[-1]
+    return leaf in _PROFILE_IMPORT_SENSITIVE_FILES or _is_request_dump_name(leaf)
+
+
+def _harden_imported_profile_tree(root: Path) -> None:
+    """Clamp imported sensitive profile state to owner-only modes."""
+
+    for path in sorted(root.rglob("*")):
+        try:
+            rel_parts = list(path.relative_to(root).parts)
+        except ValueError:
+            continue
+        if not _profile_import_path_is_sensitive(rel_parts):
+            continue
+        try:
+            if path.is_dir():
+                os.chmod(path, 0o700)
+            elif path.is_file():
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 # Names that cannot be used as profile aliases
 _RESERVED_NAMES = frozenset({
@@ -1881,7 +1940,11 @@ def _default_export_ignore(root_dir: Path):
         ignored: set = set()
         for entry in contents:
             # Universal exclusions (any depth)
-            if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
+            if (
+                entry == "__pycache__"
+                or entry.endswith((".sock", ".tmp"))
+                or _is_request_dump_name(entry)
+            ):
                 ignored.add(entry)
             # npm lockfiles can appear at root
             elif entry in {"package.json", "package-lock.json"}:
@@ -1892,6 +1955,32 @@ def _default_export_ignore(root_dir: Path):
             ignored.update(
                 entry for entry in contents if entry not in _DEFAULT_EXPORT_INCLUDE_ROOT
             )
+        return ignored
+
+    return _ignore
+
+
+def _named_profile_export_ignore(root_dir: Path):
+    """Return an ignore callable for named-profile exports.
+
+    Named profiles are already rooted at a controlled profile directory, so
+    preserve user-facing profile artifacts while excluding credentials,
+    runtime state, histories, backups, snapshots, and request dumps.
+    """
+
+    def _ignore(directory: str, contents: list) -> set:
+        ignored: set = set()
+        for entry in contents:
+            if (
+                entry == "__pycache__"
+                or entry.endswith((".sock", ".tmp"))
+                or _is_request_dump_name(entry)
+            ):
+                ignored.add(entry)
+            elif entry in {"package.json", "package-lock.json"}:
+                ignored.add(entry)
+        if Path(directory) == root_dir:
+            ignored.update(c for c in contents if c in _DEFAULT_EXPORT_EXCLUDE_ROOT)
         return ignored
 
     return _ignore
@@ -1929,15 +2018,15 @@ def export_profile(name: str, output_path: str) -> Path:
             result = shutil.make_archive(base, "gztar", tmpdir, "default")
             return Path(result)
 
-    # Named profiles — stage a filtered copy to exclude credentials
+    # Named profiles — stage a filtered copy to exclude credentials,
+    # runtime state, history, backups, snapshots, and checkpoint artifacts.
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
         shutil.copytree(
             profile_dir,
             staged,
             symlinks=True,
-            ignore=lambda d, contents: _CREDENTIAL_FILES & set(contents),
+            ignore=_named_profile_export_ignore(profile_dir),
         )
         result = shutil.make_archive(base, "gztar", tmpdir, canon)
         return Path(result)
@@ -2066,6 +2155,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
         staging_root = Path(tmpdir)
         _safe_extract_profile_archive(archive, staging_root)
+        _harden_imported_profile_tree(staging_root)
 
         extracted = staging_root / archive_root
         if not extracted.is_dir():
