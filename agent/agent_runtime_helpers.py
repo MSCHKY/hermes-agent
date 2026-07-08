@@ -1420,7 +1420,7 @@ def dump_api_request_debug(
                 "method": "POST",
                 "url": f"{agent.base_url.rstrip('/')}{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}",
                 "headers": {
-                    "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
+                    "Authorization": "[REDACTED]",
                     "Content-Type": "application/json",
                 },
                 "body": body,
