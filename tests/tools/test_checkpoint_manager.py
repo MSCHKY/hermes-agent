@@ -14,6 +14,7 @@ from tools.checkpoint_manager import (
     _shadow_repo_path,
     _init_shadow_repo,
     _init_store,
+    _secure_store_permissions,
     _run_git,
     _git_env,
     _dir_file_count,
@@ -29,6 +30,29 @@ from tools.checkpoint_manager import (
     clear_all,
     clear_legacy,
 )
+
+
+def _broad_store_paths(store: Path) -> list[tuple[Path, int]]:
+    broad: list[tuple[Path, int]] = []
+    for dirpath, dirnames, filenames in os.walk(store, followlinks=False):
+        current_dir = Path(dirpath)
+        if not current_dir.is_symlink():
+            mode = current_dir.stat().st_mode & 0o777
+            if mode & 0o077:
+                broad.append((current_dir, mode))
+        dirnames[:] = [name for name in dirnames if not (current_dir / name).is_symlink()]
+        for name in filenames:
+            path = current_dir / name
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                broad.append((path, mode))
+    return broad
+
+
+def _assert_store_owner_only(store: Path) -> None:
+    assert _broad_store_paths(store) == []
 
 
 # =========================================================================
@@ -138,6 +162,27 @@ class TestStoreInit:
         assert (store / "HEAD").exists()
         assert (store / "HERMES_WORKDIR").exists()
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+    def test_secure_store_permissions_clamps_git_created_paths(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        broad_dir = store / "objects" / "aa"
+        broad_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(broad_dir, 0o755)
+        broad_file = store / "packed-refs"
+        broad_file.write_text("# pack-refs with: peeled fully-peeled sorted\n")
+        os.chmod(broad_file, 0o644)
+
+        _secure_store_permissions(store)
+
+        assert (broad_dir.stat().st_mode & 0o777) == 0o700
+        assert (broad_file.stat().st_mode & 0o777) == 0o600
+        _assert_store_owner_only(store)
+
     def test_legacy_migration_archives_prev2_repos(
         self, checkpoint_base, work_dir,
     ):
@@ -183,6 +228,20 @@ class TestTakeCheckpoint:
     def test_first_checkpoint(self, mgr, work_dir):
         result = mgr.ensure_checkpoint(str(work_dir), "initial")
         assert result is True
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+    def test_first_checkpoint_leaves_store_owner_only(self, mgr, work_dir, checkpoint_base):
+        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
+        _assert_store_owner_only(_store_path(checkpoint_base))
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes only")
+    def test_no_change_checkpoint_keeps_index_owner_only(self, mgr, work_dir, checkpoint_base):
+        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
+        mgr.new_turn()
+        assert mgr.ensure_checkpoint(str(work_dir), "no changes") is False
+        index_file = _store_path(checkpoint_base) / "indexes" / _project_hash(str(work_dir))
+        assert (index_file.stat().st_mode & 0o777) == 0o600
+        _assert_store_owner_only(_store_path(checkpoint_base))
 
     def test_dedup_same_turn(self, mgr, work_dir):
         r1 = mgr.ensure_checkpoint(str(work_dir), "first")

@@ -294,6 +294,47 @@ def _repair_bare_repo_dirs(store: Path) -> None:
                     "Cannot create %s in checkpoint store: %s", subdir, exc,
                 )
 
+    _secure_store_permissions(store)
+
+
+def _secure_store_permissions(store: Path) -> None:
+    """Clamp checkpoint-store internals to owner-only modes.
+
+    Git creates indexes, refs, packs, and metadata with process umask defaults
+    such as 0644/0444 files and 0755 directories. The store normally sits
+    behind owner-only ancestors, but exported/copied stores should not carry
+    broad-readable inner bits by default.
+    """
+    try:
+        if not store.exists():
+            return
+    except OSError:
+        return
+
+    def chmod_if_needed(path: Path, mode: int) -> None:
+        try:
+            if path.is_symlink():
+                return
+            current = path.stat().st_mode & 0o777
+            if current != mode:
+                os.chmod(path, mode)
+        except OSError as exc:
+            logger.debug("Could not secure checkpoint path %s: %s", path, exc)
+
+    chmod_if_needed(store, 0o700)
+    for dirpath, dirnames, filenames in os.walk(store, followlinks=False):
+        current_dir = Path(dirpath)
+        chmod_if_needed(current_dir, 0o700)
+        dirnames[:] = [
+            name for name in dirnames if not (current_dir / name).is_symlink()
+        ]
+        for name in filenames:
+            path = current_dir / name
+            if path.is_dir():
+                chmod_if_needed(path, 0o700)
+            else:
+                chmod_if_needed(path, 0o600)
+
 
 def _run_git(
     args: List[str],
@@ -433,6 +474,7 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _migrate_legacy_store(base)
 
     if (store / "HEAD").exists():
+        _secure_store_permissions(store)
         return None
 
     store.mkdir(parents=True, exist_ok=True)
@@ -479,6 +521,8 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         "\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8"
     )
 
+    _secure_store_permissions(store)
+
     logger.debug("Initialised checkpoint store at %s", store)
     return None
 
@@ -500,6 +544,7 @@ def _register_project(store: Path, working_dir: str) -> None:
     try:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        _secure_store_permissions(store)
     except OSError as exc:
         logger.debug("Could not write project metadata %s: %s", meta_path, exc)
 
@@ -522,6 +567,7 @@ def _touch_project(store: Path, working_dir: str) -> None:
     meta.setdefault("created_at", meta["last_touch"])
     try:
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        _secure_store_permissions(store)
     except OSError as exc:
         logger.debug("Could not update project metadata %s: %s", meta_path, exc)
 
@@ -596,6 +642,7 @@ def _init_shadow_repo(shadow_repo: Path, working_dir: str) -> Optional[str]:
         (shadow_repo / "HERMES_WORKDIR").write_text(
             str(_normalize_path(working_dir)) + "\n", encoding="utf-8"
         )
+        _secure_store_permissions(shadow_repo)
     except OSError:
         pass
     return None
@@ -924,12 +971,14 @@ class CheckpointManager:
             ["add", "-A"], store, working_dir,
             timeout=_GIT_TIMEOUT * 2, index_file=index_file,
         )
+        _secure_store_permissions(store)
         if not ok:
             logger.debug("Checkpoint git-add failed: %s", err)
             return False
 
         if self.max_file_size_mb > 0:
             self._drop_oversize_from_index(store, working_dir, index_file)
+            _secure_store_permissions(store)
 
         # Compare against the current ref tip (not HEAD — HEAD points to a
         # branch that doesn't exist on a bare store, so ``diff --cached``
@@ -950,6 +999,7 @@ class CheckpointManager:
             )
             if ok_diff:
                 logger.debug("Checkpoint skipped: no changes in %s", working_dir)
+                _secure_store_permissions(store)
                 return False
         else:
             # No ref yet — skip only if the index is empty.
@@ -960,6 +1010,7 @@ class CheckpointManager:
             )
             if ok_ls and not ls_out.strip():
                 logger.debug("Checkpoint skipped: empty tree in %s", working_dir)
+                _secure_store_permissions(store)
                 return False
 
         # Write tree from per-project index.
@@ -969,6 +1020,7 @@ class CheckpointManager:
         )
         if not ok_tree or not tree_sha:
             logger.debug("Checkpoint write-tree failed: %s", err)
+            _secure_store_permissions(store)
             return False
 
         # Build commit (parent = current ref tip, if any).
@@ -981,6 +1033,7 @@ class CheckpointManager:
         )
         if not ok_commit or not new_sha:
             logger.debug("Checkpoint commit-tree failed: %s", err)
+            _secure_store_permissions(store)
             return False
 
         # Update the per-project ref.
@@ -992,6 +1045,7 @@ class CheckpointManager:
         )
         if not ok_update:
             logger.debug("Checkpoint update-ref failed: %s", err)
+            _secure_store_permissions(store)
             return False
 
         logger.debug("Checkpoint taken in %s: %s (%s)", working_dir, reason, new_sha[:8])
@@ -1001,6 +1055,8 @@ class CheckpointManager:
 
         # Enforce global size cap.
         self._enforce_size_cap(store)
+
+        _secure_store_permissions(store)
 
         return True
 
@@ -1116,6 +1172,7 @@ class CheckpointManager:
             store, working_dir, timeout=_GIT_TIMEOUT * 3,
         )
         _repair_bare_repo_dirs(store)
+        _secure_store_permissions(store)
 
     def _enforce_size_cap(self, store: Path) -> None:
         """If total store size exceeds ``max_total_size_mb``, drop oldest
@@ -1204,6 +1261,7 @@ class CheckpointManager:
             store, str(store.parent), timeout=_GIT_TIMEOUT * 3,
         )
         _repair_bare_repo_dirs(store)
+        _secure_store_permissions(store)
 
 
 def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
